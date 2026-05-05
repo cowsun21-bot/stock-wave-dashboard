@@ -4,6 +4,103 @@ from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
+try:
+    import FinanceDataReader as fdr
+except Exception:
+    fdr = None
+
+
+def normalize_stock_code_for_name(code) -> str:
+    if code is None:
+        return ""
+    try:
+        if pd.isna(code):
+            return ""
+    except Exception:
+        pass
+
+    text = str(code).strip()
+    if not text:
+        return ""
+
+    try:
+        if text.replace(".", "", 1).isdigit():
+            text = str(int(float(text)))
+    except Exception:
+        pass
+
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if digits:
+        return digits.zfill(6)[-6:]
+
+    return text
+
+
+@st.cache_data(show_spinner=False)
+def get_krx_name_map() -> dict:
+    if fdr is None:
+        return {}
+
+    try:
+        listing = fdr.StockListing("KRX")
+        if listing is None or listing.empty:
+            return {}
+
+        if "Code" not in listing.columns or "Name" not in listing.columns:
+            return {}
+
+        listing = listing[["Code", "Name"]].copy()
+        listing["Code"] = listing["Code"].apply(normalize_stock_code_for_name)
+        listing["Name"] = listing["Name"].fillna("").astype(str).str.strip()
+
+        return dict(zip(listing["Code"], listing["Name"]))
+    except Exception:
+        return {}
+
+
+def fill_stock_names(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    if "종목코드" not in out.columns:
+        return out
+
+    out["종목코드"] = out["종목코드"].apply(normalize_stock_code_for_name)
+
+    if "종목명" not in out.columns:
+        out["종목명"] = ""
+
+    name_map = get_krx_name_map()
+
+    empty_name = (
+        out["종목명"].isna()
+        | out["종목명"].astype(str).str.strip().str.lower().isin(["", "nan", "none"])
+    )
+
+    if name_map:
+        out.loc[empty_name, "종목명"] = out.loc[empty_name, "종목코드"].map(name_map)
+
+    out["종목명"] = out["종목명"].fillna("").astype(str).str.strip()
+    out.loc[out["종목명"].isin(["", "nan", "None", "none"]), "종목명"] = "종목명 미확인"
+
+    return out
+
+
+def show_name_mapping_status(df: pd.DataFrame):
+    if df is None or df.empty or "종목명" not in df.columns:
+        return
+
+    total = len(df)
+    unknown_count = int((df["종목명"] == "종목명 미확인").sum())
+    success_count = total - unknown_count
+
+    st.caption(f"종목명 매핑: {total}개 중 {success_count}개 표시 완료")
+
+    if unknown_count > 0 and "종목코드" in df.columns:
+        unknown_codes = df.loc[df["종목명"] == "종목명 미확인", "종목코드"].tolist()
+        st.warning(f"종목명 미확인 종목코드: {', '.join(unknown_codes)}")
 
 from config.constants import DISCLAIMER
 from config.settings import DART_API_KEY
@@ -161,49 +258,217 @@ def single_stock_view():
     if disclosures is not None and not disclosures.empty:
         st.dataframe(disclosures, use_container_width=True)
 
-
 def multi_stock_view():
     st.header("여러 종목 TOP10 랭킹")
-    code_text = st.text_area("종목코드 리스트", value="138360\n005930\n000660", height=120)
+
+    code_text = st.text_area(
+        "종목코드 리스트",
+        value="138360\n308080\n066430\n131400",
+        height=120,
+    )
+
     uploaded = st.file_uploader("종목코드 CSV 업로드", type=["csv"], key="ranking_csv")
     start = st.date_input("랭킹 시작일", value=date.today() - timedelta(days=500))
     end = st.date_input("랭킹 종료일", value=date.today())
 
     if st.button("TOP10 분석 실행"):
-        codes = [normalize_ticker(x) for x in code_text.replace(",", "\n").splitlines() if x.strip()]
+        codes = [
+            normalize_ticker(x)
+            for x in code_text.replace(",", "\n").splitlines()
+            if x.strip()
+        ]
+
         if uploaded is not None:
             upload_df = pd.read_csv(uploaded)
             first_col = upload_df.columns[0]
             codes.extend(upload_df[first_col].dropna().astype(str).tolist())
+
         codes = list(dict.fromkeys(codes))
+
         if not codes:
             st.warning("분석할 종목코드를 입력해주세요.")
             return
+
         with st.spinner("여러 종목을 분석 중입니다."):
             price_map = fetch_multi_stocks(codes, start, end)
             results = []
+
             for code, df in price_map.items():
                 if df is None or df.empty:
                     continue
+
                 try:
                     results.append(analyze_stock_for_ranking(code, df, disclosures=[]))
                 except Exception:
                     continue
+
         if not results:
             st.warning("분석 가능한 데이터가 없습니다.")
             return
-        table = make_ranking_table(results)
-        st.subheader("종합 TOP10")
-        st.dataframe(table, use_container_width=True)
-        st.subheader("예상상승률 TOP10")
-        st.dataframe(table.sort_values("예상상승률%", ascending=False).head(10), use_container_width=True)
-        st.subheader("3일 급등 가능성 TOP10")
-        st.dataframe(table.sort_values("3일 급등 가능성%", ascending=False).head(10), use_container_width=True)
-        st.subheader("파동강도 TOP10")
-        st.dataframe(table.sort_values("파동강도", ascending=False).head(10), use_container_width=True)
-        st.subheader("폭발성 TOP10")
-        st.dataframe(table.sort_values("폭발성", ascending=False).head(10), use_container_width=True)
 
+        table = make_ranking_table(results)
+        table = fill_stock_names(table)
+        show_name_mapping_status(table)
+
+        table = table.rename(
+            columns={
+                "30% 매도 가격": "1차매도",
+                "폭발성": "폭발성점수",
+            }
+        )
+
+        default_columns = {
+            "공시점수": 0,
+            "희석여부": "N",
+            "공시성격": "미연동",
+            "공시강도": "보통",
+            "종합판정": "관찰",
+            "총점": 0,
+            "폭발성점수": 0,
+        }
+
+        for col, default_value in default_columns.items():
+            if col not in table.columns:
+                table[col] = default_value
+
+        if "예상상승금액" in table.columns:
+            table = table.drop(columns=["예상상승금액"])
+
+        def display_ranking_df(df, columns):
+            display_df = fill_stock_names(df.copy())
+
+            display_df = display_df.rename(
+                columns={
+                    "30% 매도 가격": "1차매도",
+                    "폭발성": "폭발성점수",
+                }
+            )
+
+            if "예상상승금액" in display_df.columns:
+                display_df = display_df.drop(columns=["예상상승금액"])
+
+            for col, default_value in default_columns.items():
+                if col not in display_df.columns:
+                    display_df[col] = default_value
+
+            existing_columns = [col for col in columns if col in display_df.columns]
+            display_df = display_df[existing_columns].reset_index(drop=True)
+
+            try:
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+            except TypeError:
+                st.dataframe(display_df, use_container_width=True)
+
+        summary_cols = [
+            "순위",
+            "종목코드",
+            "종목명",
+            "현재가",
+            "파동위치",
+            "종합판정",
+            "총점",
+            "폭발성점수",
+            "3일 급등 가능성%",
+            "예상상승률%",
+            "1차매도",
+            "재매수 가격",
+            "공시점수",
+            "희석여부",
+        ]
+
+        return_cols = [
+            "순위",
+            "종목코드",
+            "종목명",
+            "현재가",
+            "파동위치",
+            "예상상승률%",
+            "120일 목표가",
+            "폭발성점수",
+            "1차매도",
+            "재매수 가격",
+            "공시점수",
+            "희석여부",
+        ]
+
+        surge_cols = [
+            "순위",
+            "종목코드",
+            "종목명",
+            "현재가",
+            "파동위치",
+            "3일 급등 가능성%",
+            "폭발성점수",
+            "파동강도",
+            "1차매도",
+            "재매수 가격",
+            "공시점수",
+            "희석여부",
+        ]
+
+        wave_cols = [
+            "순위",
+            "종목코드",
+            "종목명",
+            "현재가",
+            "파동위치",
+            "파동강도",
+            "폭발성점수",
+            "3파 트리거",
+            "손절가",
+            "종합판정",
+            "공시점수",
+            "희석여부",
+        ]
+
+        explosion_cols = [
+            "순위",
+            "종목코드",
+            "종목명",
+            "현재가",
+            "파동위치",
+            "폭발성점수",
+            "3일 급등 가능성%",
+            "파동강도",
+            "예상상승률%",
+            "공시점수",
+            "희석여부",
+            "종합판정",
+        ]
+
+        st.subheader("종합 TOP10")
+        display_ranking_df(table.head(10), summary_cols)
+
+        st.subheader("예상상승률 TOP10")
+        display_ranking_df(
+            table.sort_values("예상상승률%", ascending=False).head(10),
+            return_cols,
+        )
+
+        st.subheader("3일 급등 가능성 TOP10")
+        display_ranking_df(
+            table.sort_values("3일 급등 가능성%", ascending=False).head(10),
+            surge_cols,
+        )
+
+        st.subheader("파동강도 TOP10")
+        display_ranking_df(
+            table.sort_values("파동강도", ascending=False).head(10),
+            wave_cols,
+        )
+
+        st.subheader("폭발성 TOP10")
+        display_ranking_df(
+            table.sort_values("폭발성점수", ascending=False).head(10),
+            explosion_cols,
+        )
+
+        with st.expander("전체 상세 데이터 보기"):
+            detail_table = table.reset_index(drop=True)
+            try:
+                st.dataframe(detail_table, use_container_width=True, hide_index=True)
+            except TypeError:
+                st.dataframe(detail_table, use_container_width=True)
 
 def disclosure_view():
     st.header("공시 조회")
